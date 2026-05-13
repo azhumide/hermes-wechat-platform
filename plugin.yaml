@@ -1,0 +1,25 @@
+name: wechat-platform
+label: WeChat
+kind: platform
+version: 1.0.0
+description: >
+  WeChat gateway adapter for Hermes Agent. Connects to the aibot
+  HermesBridge plugin over WebSocket without modifying Hermes source code.
+author: local
+optional_env:
+  - name: WECHAT_BRIDGE_WS_URL
+    description: "HermesBridge WebSocket URL, for example ws://127.0.0.1:9094/ws"
+    prompt: "HermesBridge WebSocket URL"
+    password: false
+  - name: WECHAT_ALLOWED_USERS
+    description: "Comma-separated WeChat wxid/chatroom IDs allowed to talk to Hermes"
+    prompt: "Allowed WeChat users"
+    password: false
+  - name: WECHAT_ALLOW_ALL_USERS
+    description: "Allow all WeChat users routed by HermesBridge"
+    prompt: "Allow all WeChat users? (true/false)"
+    password: false
+  - name: WECHAT_HOME_CHANNEL
+    description: "Default wxid or chatroom ID for cron and notifications"
+    prompt: "Home channel"
+    password: false
