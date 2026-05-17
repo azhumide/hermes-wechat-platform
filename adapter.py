@@ -134,6 +134,127 @@ def _clean_media_caption(caption: Optional[str]) -> str:
     return text
 
 
+_LOCAL_ATTACHMENT_EXTS = (
+    ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp",
+    ".mp4", ".avi", ".mov", ".mkv", ".webm", ".3gp",
+    ".mp3", ".wav", ".amr", ".flac", ".aac", ".ogg", ".m4a", ".opus",
+    ".md", ".txt", ".csv", ".pdf", ".epub",
+    ".zip", ".rar", ".7z",
+    ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+    ".apk", ".ipa",
+)
+
+
+def _coerce_media_entry(media: Any) -> Tuple[str, bool]:
+    if isinstance(media, (list, tuple)):
+        media_path = str(media[0] if media else "").strip()
+        is_voice = bool(media[1]) if len(media) > 1 else False
+    else:
+        media_path = str(media or "").strip()
+        is_voice = False
+    return media_path, is_voice
+
+
+def _normalize_local_attachment_path(raw_path: str) -> Optional[str]:
+    path = str(raw_path or "").strip().strip("`\"'")
+    if not path:
+        return None
+    if path.startswith("file://"):
+        path = path[len("file://"):]
+    expanded = os.path.abspath(os.path.expanduser(path))
+    if not os.path.isfile(expanded):
+        return None
+    if Path(expanded).suffix.lower() not in _LOCAL_ATTACHMENT_EXTS:
+        return None
+    return expanded
+
+
+def _extract_local_attachment_paths(content: str) -> Tuple[List[str], str]:
+    """Detect bare/backticked local document paths not covered by Hermes core."""
+    text = str(content or "")
+    if not text:
+        return [], text
+
+    ext_part = "|".join(re.escape(ext.lstrip(".")) for ext in _LOCAL_ATTACHMENT_EXTS)
+    patterns = [
+        re.compile(
+            r"(?P<quote>[`\"'])(?P<path>(?:file://)?(?:~/|/)[^`\"']+?\.(?:"
+            + ext_part
+            + r"))(?P=quote)",
+            re.IGNORECASE,
+        ),
+        re.compile(
+            r"(?<![/:\w.])(?P<path>(?:file://)?(?:~/|/)[^\s`\"',;:)\]}]+?\.(?:"
+            + ext_part
+            + r"))\b",
+            re.IGNORECASE,
+        ),
+    ]
+
+    found: List[str] = []
+    seen = set()
+    spans: List[Tuple[int, int]] = []
+    for pattern in patterns:
+        for match in pattern.finditer(text):
+            normalized = _normalize_local_attachment_path(match.group("path"))
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            found.append(normalized)
+            spans.append(match.span())
+
+    if not found:
+        return [], text
+
+    cleaned_parts: List[str] = []
+    pos = 0
+    for start, end in sorted(spans):
+        if start < pos:
+            continue
+        cleaned_parts.append(text[pos:start])
+        pos = end
+    cleaned_parts.append(text[pos:])
+    cleaned = "".join(cleaned_parts)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    return found, cleaned
+
+
+def _build_media_payload(chat_id: str, media_path: str, caption: Optional[str], *, audio_as_voice: bool) -> Dict[str, Any]:
+    name = os.path.basename(media_path.rstrip("/")) or "attachment"
+    mime, _ = mimetypes.guess_type(name)
+    payload: Dict[str, Any] = {
+        "to": chat_id,
+        "type": "media",
+        "text": _clean_media_caption(caption),
+        "mediaUrl": media_path,
+        "name": name,
+        "filename": name,
+        "mime": mime or "application/octet-stream",
+    }
+    if audio_as_voice:
+        payload["audioAsVoice"] = True
+    return payload
+
+
+def _resolve_send_chat_id(chat_id: str) -> str:
+    """Keep bare send_message(target='wechat') inside the active WeChat chat."""
+    target = str(chat_id or "").strip()
+    configured_home = os.getenv("WECHAT_HOME_CHANNEL", "").strip()
+    if not target or not configured_home or target != configured_home:
+        return target
+
+    current_home = _current_wechat_home_channel()
+    current_chat_id = (current_home or {}).get("chat_id", "").strip()
+    if current_chat_id and current_chat_id != target:
+        logger.info(
+            "WeChat bridge remapped configured home send to active chat: %s -> %s",
+            target,
+            current_chat_id,
+        )
+        return current_chat_id
+    return target
+
+
 class WeChatBridgeAdapter(BasePlatformAdapter):
     def __init__(self, config, **kwargs):
         super().__init__(config=config, platform=Platform("wechat"))
@@ -144,6 +265,8 @@ class WeChatBridgeAdapter(BasePlatformAdapter):
         self._session: Optional[aiohttp.ClientSession] = None
         self._ws: Optional[aiohttp.ClientWebSocketResponse] = None
         self._connect_task: Optional[asyncio.Task] = None
+        self._dispatch_task: Optional[asyncio.Task] = None
+        self._dispatch_queue: asyncio.Queue[Dict[str, Any]] = asyncio.Queue()
         self._send_lock = asyncio.Lock()
         self._ready = asyncio.Event()
         self._stopping = False
@@ -162,6 +285,14 @@ class WeChatBridgeAdapter(BasePlatformAdapter):
     async def disconnect(self) -> None:
         self._stopping = True
         self._ready.clear()
+        if self._dispatch_task and not self._dispatch_task.done():
+            self._dispatch_task.cancel()
+            try:
+                await self._dispatch_task
+            except asyncio.CancelledError:
+                pass
+        self._dispatch_task = None
+        self._clear_dispatch_queue()
         if self._connect_task and not self._connect_task.done():
             self._connect_task.cancel()
             try:
@@ -189,6 +320,7 @@ class WeChatBridgeAdapter(BasePlatformAdapter):
                 pass
 
     async def _connect_loop(self) -> None:
+        self._ensure_dispatch_task()
         while not self._stopping:
             try:
                 timeout = aiohttp.ClientTimeout(total=None, connect=15)
@@ -221,6 +353,27 @@ class WeChatBridgeAdapter(BasePlatformAdapter):
                 break
             await asyncio.sleep(max(self.reconnect_delay_seconds, 0.5))
 
+    def _ensure_dispatch_task(self) -> None:
+        if self._dispatch_task and not self._dispatch_task.done():
+            return
+        self._dispatch_task = asyncio.create_task(self._dispatch_loop())
+
+    def _clear_dispatch_queue(self) -> None:
+        while True:
+            try:
+                self._dispatch_queue.get_nowait()
+                self._dispatch_queue.task_done()
+            except asyncio.QueueEmpty:
+                break
+
+    async def _dispatch_loop(self) -> None:
+        while True:
+            payload = await self._dispatch_queue.get()
+            try:
+                await self._dispatch_inbound(payload)
+            finally:
+                self._dispatch_queue.task_done()
+
     async def _receive_loop(self, ws: aiohttp.ClientWebSocketResponse) -> None:
         async for msg in ws:
             if msg.type == aiohttp.WSMsgType.TEXT:
@@ -245,7 +398,8 @@ class WeChatBridgeAdapter(BasePlatformAdapter):
             return
 
         payload = frame.get("payload") if isinstance(frame.get("payload"), dict) else {}
-        await self._dispatch_inbound(payload)
+        self._ensure_dispatch_task()
+        self._dispatch_queue.put_nowait(payload)
 
     async def _dispatch_inbound(self, payload: Dict[str, Any]) -> None:
         if not self._message_handler:
@@ -257,10 +411,22 @@ class WeChatBridgeAdapter(BasePlatformAdapter):
             return
 
         text = str(payload.get("content") or payload.get("text") or "").strip()
-        is_group = bool(payload.get("isGroup") or payload.get("is_group"))
+        route_type = str(payload.get("routeType") or payload.get("chatType") or "").strip().lower()
+        is_group = (
+            route_type == "group"
+            or bool(payload.get("isGroup") or payload.get("is_group"))
+            or chat_id.startswith(("group__", "group:"))
+            or chat_id.endswith("@chatroom")
+        )
         sender_id = str(payload.get("senderId") or payload.get("sender_id") or chat_id)
         sender_name = str(payload.get("senderName") or payload.get("fromName") or payload.get("from_name") or sender_id)
-        chat_name = str(payload.get("groupName") or payload.get("chatName") or payload.get("fromName") or chat_id)
+        chat_name = str(
+            payload.get("groupName")
+            or payload.get("chatName")
+            or payload.get("displayThreadId")
+            or payload.get("fromName")
+            or chat_id
+        )
         message_id = str(payload.get("msg_id") or payload.get("message_id") or "") or None
 
         media_urls, media_types, message_type = self._extract_media(payload)
@@ -344,7 +510,33 @@ class WeChatBridgeAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        ok = await self._send_frame("outbound_text", {"to": chat_id, "text": content or "", "type": "text"})
+        chat_id = _resolve_send_chat_id(chat_id)
+        text = content or ""
+        media_files, cleaned_text = self.extract_media(text)
+        local_files, cleaned_text = self.extract_local_files(cleaned_text)
+        attachment_files, cleaned_text = _extract_local_attachment_paths(cleaned_text)
+
+        pending_media: List[Tuple[str, bool]] = []
+        pending_media.extend(media_files or [])
+        pending_media.extend((path, False) for path in (local_files or []))
+        pending_media.extend((path, False) for path in (attachment_files or []))
+
+        last_message_id: Optional[str] = None
+        for media_path, is_voice in pending_media:
+            result = await self._send_media(chat_id, media_path, None, audio_as_voice=is_voice)
+            if not result.success:
+                return result
+            last_message_id = result.message_id
+
+        cleaned_text = cleaned_text.strip()
+        if cleaned_text:
+            ok = await self._send_frame("outbound_text", {"to": chat_id, "text": cleaned_text, "type": "text"})
+            return SendResult(success=ok, message_id=str(_now_ms()) if ok else last_message_id, error=None if ok else "WeChat bridge is not connected", retryable=not ok)
+
+        if pending_media:
+            return SendResult(success=True, message_id=last_message_id or str(_now_ms()))
+
+        ok = await self._send_frame("outbound_text", {"to": chat_id, "text": text, "type": "text"})
         return SendResult(success=ok, message_id=str(_now_ms()) if ok else None, error=None if ok else "WeChat bridge is not connected", retryable=not ok)
 
     async def send_image(
@@ -403,20 +595,14 @@ class WeChatBridgeAdapter(BasePlatformAdapter):
         return await self._send_media(chat_id, video_path, caption, audio_as_voice=False)
 
     async def _send_media(self, chat_id: str, media_url: str, caption: Optional[str], *, audio_as_voice: bool) -> SendResult:
-        payload = {
-            "to": chat_id,
-            "type": "media",
-            "text": _clean_media_caption(caption),
-            "mediaUrl": media_url,
-        }
-        if audio_as_voice:
-            payload["audioAsVoice"] = True
+        payload = _build_media_payload(chat_id, media_url, caption, audio_as_voice=audio_as_voice)
         ok = await self._send_frame("outbound_media", payload)
         return SendResult(success=ok, message_id=str(_now_ms()) if ok else None, error=None if ok else "WeChat bridge is not connected", retryable=not ok)
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         chat_id = str(chat_id or "")
-        return {"name": chat_id, "type": "group" if chat_id.endswith("@chatroom") else "dm"}
+        is_group = chat_id.startswith(("group__", "group:")) or chat_id.endswith("@chatroom")
+        return {"name": chat_id, "type": "group" if is_group else "dm"}
 
 
 def check_requirements() -> bool:
@@ -431,15 +617,37 @@ def is_connected(config) -> bool:
     return bool(_bridge_ws_url(config))
 
 
+def _current_wechat_home_channel() -> Optional[Dict[str, str]]:
+    """Use the active WeChat chat as the implicit send_message home target."""
+    try:
+        from gateway.session_context import get_session_env
+    except Exception:
+        return None
+
+    platform = get_session_env("HERMES_SESSION_PLATFORM", "").strip().lower()
+    chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "").strip()
+    if platform != "wechat" or not chat_id:
+        return None
+
+    return {
+        "chat_id": chat_id,
+        "name": get_session_env("HERMES_SESSION_CHAT_NAME", "").strip() or chat_id,
+    }
+
+
 def _env_enablement() -> dict | None:
     ws_url = _bridge_ws_url()
     seed = {"bridge_ws_url": ws_url}
-    home = os.getenv("WECHAT_HOME_CHANNEL", "").strip()
-    if home:
-        seed["home_channel"] = {
-            "chat_id": home,
-            "name": os.getenv("WECHAT_HOME_CHANNEL_NAME", home),
-        }
+    current_home = _current_wechat_home_channel()
+    if current_home:
+        seed["home_channel"] = current_home
+    else:
+        home = os.getenv("WECHAT_HOME_CHANNEL", "").strip()
+        if home:
+            seed["home_channel"] = {
+                "chat_id": home,
+                "name": os.getenv("WECHAT_HOME_CHANNEL_NAME", home),
+            }
     return seed
 
 
@@ -453,10 +661,21 @@ async def _standalone_send(
     force_document: bool = False,
 ) -> Dict[str, Any]:
     ws_url = _bridge_ws_url(pconfig)
+    chat_id = _resolve_send_chat_id(chat_id)
     frames: List[Dict[str, Any]] = []
     media_files = media_files or []
     for media in media_files:
-        frames.append({"event": "outbound_media", "payload": {"to": chat_id, "type": "media", "text": "", "mediaUrl": media}})
+        media_path, is_voice = _coerce_media_entry(media)
+        if media_path:
+            frames.append({
+                "event": "outbound_media",
+                "payload": _build_media_payload(
+                    chat_id,
+                    media_path,
+                    "",
+                    audio_as_voice=is_voice,
+                ),
+            })
     if message:
         frames.append({"event": "outbound_text", "payload": {"to": chat_id, "text": message, "type": "text"}})
     if not frames:
@@ -499,6 +718,10 @@ def register(ctx):
             "You are chatting through WeChat via a local aibot bridge. "
             "Use concise plain text. You may return media or file paths when "
             "appropriate; the bridge can deliver images, documents, audio, "
-            "video, cards, and emoji markers back to WeChat."
+            "video, cards, and emoji markers back to WeChat. When sending a "
+            "file or media to this current WeChat chat, put MEDIA:/absolute/path "
+            "in your final response instead of calling send_message; the final "
+            "response is already delivered to the current chat, and send_message "
+            "is only for cross-channel delivery."
         ),
     )
