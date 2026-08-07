@@ -11,6 +11,7 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import quote, unquote, urlparse
 
 import aiohttp
 
@@ -78,6 +79,26 @@ def _bridge_ws_url(config: Any = None) -> str:
         or extra.get("ws_url")
         or DEFAULT_WS_URL
     )
+
+
+def _bridge_media_settings(config: Any = None) -> Tuple[str, str]:
+    extra = getattr(config, "extra", {}) or {}
+    base_url = str(
+        os.getenv("WECHAT_BRIDGE_MEDIA_URL")
+        or extra.get("bridge_media_url")
+        or extra.get("bridge_media_base_url")
+        or ""
+    ).strip().rstrip("/")
+    token = str(
+        os.getenv("WECHAT_BRIDGE_MEDIA_TOKEN")
+        or extra.get("bridge_media_token")
+        or ""
+    ).strip()
+    return base_url, token
+
+
+def _is_http_url(value: str) -> bool:
+    return str(value or "").strip().lower().startswith(("http://", "https://"))
 
 
 def _now_ms() -> int:
@@ -220,7 +241,9 @@ def _extract_local_attachment_paths(content: str) -> Tuple[List[str], str]:
 
 
 def _build_media_payload(chat_id: str, media_path: str, caption: Optional[str], *, audio_as_voice: bool) -> Dict[str, Any]:
-    name = os.path.basename(media_path.rstrip("/")) or "attachment"
+    raw_path = str(media_path or "").strip()
+    parsed = urlparse(raw_path) if _is_http_url(raw_path) else None
+    name = unquote(os.path.basename((parsed.path if parsed else raw_path).rstrip("/"))) or "attachment"
     mime, _ = mimetypes.guess_type(name)
     payload: Dict[str, Any] = {
         "to": chat_id,
@@ -234,6 +257,54 @@ def _build_media_payload(chat_id: str, media_path: str, caption: Optional[str], 
     if audio_as_voice:
         payload["audioAsVoice"] = True
     return payload
+
+
+async def _upload_media_file(
+    file_path: str,
+    config: Any = None,
+    session: Optional[aiohttp.ClientSession] = None,
+) -> Optional[str]:
+    """Upload a Hermes-local file to AiBot and return its signed URL."""
+    base_url, token = _bridge_media_settings(config)
+    if not base_url or not token:
+        return None
+
+    raw_path = str(file_path or "").strip()
+    if raw_path.startswith("file://"):
+        raw_path = raw_path[len("file://"):]
+    source = Path(os.path.expanduser(raw_path))
+    if not source.is_file():
+        raise FileNotFoundError(f"media file does not exist: {source}")
+
+    content_type = mimetypes.guess_type(source.name)[0] or "application/octet-stream"
+    headers = {
+        "X-AiBot-Media-Token": token,
+        "X-AiBot-Media-Filename": quote(source.name, safe=""),
+        "Content-Type": content_type,
+    }
+    own_session = session is None or session.closed
+    upload_session = session
+    if own_session:
+        upload_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=180, connect=15))
+
+    try:
+        with source.open("rb") as file:
+            async with upload_session.put(
+                f"{base_url}/api/bridge-media",
+                data=file,
+                headers=headers,
+            ) as response:
+                if response.status != 200:
+                    detail = (await response.text())[:240]
+                    raise RuntimeError(f"AiBot media upload failed ({response.status}): {detail}")
+                result = await response.json()
+        media_url = str(result.get("url") or "").strip()
+        if not media_url:
+            raise RuntimeError("AiBot media upload response did not include a URL")
+        return media_url
+    finally:
+        if own_session and upload_session is not None:
+            await upload_session.close()
 
 
 def _resolve_send_chat_id(chat_id: str) -> str:
@@ -275,7 +346,10 @@ class WeChatBridgeAdapter(BasePlatformAdapter):
     def name(self) -> str:
         return "WeChat"
 
-    async def connect(self) -> bool:
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
+        # Hermes Gateway 在启动及重连时都会传入 is_reconnect；
+        # 微信桥接自身统一由 _connect_loop 处理，冷启动与重连无需区别逻辑。
+        del is_reconnect
         if self._connect_task and not self._connect_task.done():
             return True
         self._stopping = False
@@ -429,7 +503,7 @@ class WeChatBridgeAdapter(BasePlatformAdapter):
         )
         message_id = str(payload.get("msg_id") or payload.get("message_id") or "") or None
 
-        media_urls, media_types, message_type = self._extract_media(payload)
+        media_urls, media_types, message_type = await self._extract_media(payload)
         source = self.build_source(
             chat_id=chat_id,
             chat_name=chat_name,
@@ -449,7 +523,7 @@ class WeChatBridgeAdapter(BasePlatformAdapter):
         )
         await self.handle_message(event)
 
-    def _extract_media(self, payload: Dict[str, Any]) -> Tuple[List[str], List[str], MessageType]:
+    async def _extract_media(self, payload: Dict[str, Any]) -> Tuple[List[str], List[str], MessageType]:
         media = payload.get("media")
         if not isinstance(media, dict):
             return [], [], MessageType.TEXT
@@ -471,10 +545,57 @@ class WeChatBridgeAdapter(BasePlatformAdapter):
 
         url_value = str(media.get("url") or media.get("mediaUrl") or path_value).strip()
         if url_value:
+            if _is_http_url(url_value):
+                try:
+                    local_path, downloaded_type = await self._download_media_url(url_value, mime, name)
+                    return [local_path], [downloaded_type.value], downloaded_type
+                except Exception as exc:
+                    logger.warning("WeChat bridge failed to download media URL: %s", exc)
+                    return [], [], MessageType.TEXT
             msg_type = _mime_to_type(mime, name or url_value)
             return [url_value], [msg_type.value], msg_type
 
         return [], [], MessageType.TEXT
+
+    async def _download_media_url(
+        self,
+        media_url: str,
+        mime: str,
+        name: str,
+    ) -> Tuple[str, MessageType]:
+        parsed = urlparse(media_url)
+        url_name = unquote(os.path.basename(parsed.path.rstrip("/")))
+        filename = name or url_name or "wechat_media"
+        session = self._session
+        own_session = session is None or session.closed
+        if own_session:
+            session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=180, connect=15))
+
+        try:
+            async with session.get(media_url) as response:
+                if response.status != 200:
+                    detail = (await response.text())[:240]
+                    raise RuntimeError(f"HTTP {response.status}: {detail}")
+                content_length = response.headers.get("Content-Length")
+                if content_length and int(content_length) > 200 * 1024 * 1024:
+                    raise RuntimeError("media exceeds the 200 MiB download limit")
+                chunks: List[bytes] = []
+                total_size = 0
+                async for chunk in response.content.iter_chunked(64 * 1024):
+                    total_size += len(chunk)
+                    if total_size > 200 * 1024 * 1024:
+                        raise RuntimeError("media exceeds the 200 MiB download limit")
+                    chunks.append(chunk)
+                data = b"".join(chunks)
+                if not data:
+                    raise RuntimeError("media response was empty")
+                response_mime = response.headers.get("Content-Type", "").split(";", 1)[0].strip()
+                local_path, msg_type = _cache_media_bytes(data, response_mime or mime, filename)
+                logger.debug("Downloaded bridge media to Hermes cache: %s", local_path)
+                return local_path, msg_type
+        finally:
+            if own_session and session is not None:
+                await session.close()
 
     async def _wait_ready(self) -> bool:
         if self._ws is not None and not self._ws.closed:
@@ -595,7 +716,18 @@ class WeChatBridgeAdapter(BasePlatformAdapter):
         return await self._send_media(chat_id, video_path, caption, audio_as_voice=False)
 
     async def _send_media(self, chat_id: str, media_url: str, caption: Optional[str], *, audio_as_voice: bool) -> SendResult:
-        payload = _build_media_payload(chat_id, media_url, caption, audio_as_voice=audio_as_voice)
+        target_url = str(media_url or "").strip()
+        if target_url and not _is_http_url(target_url):
+            try:
+                uploaded_url = await _upload_media_file(target_url, self.config, self._session)
+            except Exception as exc:
+                logger.warning("WeChat bridge media upload failed, using original path: %s", exc)
+            else:
+                if uploaded_url:
+                    target_url = uploaded_url
+                    logger.debug("Uploaded Hermes media through AiBot HTTP service: %s", media_url)
+
+        payload = _build_media_payload(chat_id, target_url, caption, audio_as_voice=audio_as_voice)
         ok = await self._send_frame("outbound_media", payload)
         return SendResult(success=ok, message_id=str(_now_ms()) if ok else None, error=None if ok else "WeChat bridge is not connected", retryable=not ok)
 
@@ -667,11 +799,17 @@ async def _standalone_send(
     for media in media_files:
         media_path, is_voice = _coerce_media_entry(media)
         if media_path:
+            target_url = media_path
+            if not _is_http_url(target_url):
+                try:
+                    target_url = await _upload_media_file(target_url, pconfig) or target_url
+                except Exception as exc:
+                    logger.warning("WeChat standalone media upload failed, using original path: %s", exc)
             frames.append({
                 "event": "outbound_media",
                 "payload": _build_media_payload(
                     chat_id,
-                    media_path,
+                    target_url,
                     "",
                     audio_as_voice=is_voice,
                 ),

@@ -23,3 +23,11 @@ optional_env:
     description: "Default wxid or chatroom ID for cron and notifications"
     prompt: "Home channel"
     password: false
+  - name: WECHAT_BRIDGE_MEDIA_URL
+    description: "AiBot HTTP media service base URL, for example http://10.10.10.80:9090"
+    prompt: "AiBot media service URL"
+    password: false
+  - name: WECHAT_BRIDGE_MEDIA_TOKEN
+    description: "Token shared with AiBot BridgeMedia.access_token"
+    prompt: "AiBot media service token"
+    password: true
