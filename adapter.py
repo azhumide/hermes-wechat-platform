@@ -94,6 +94,22 @@ def _bridge_media_settings(config: Any = None) -> Tuple[str, str]:
         or extra.get("bridge_media_token")
         or ""
     ).strip()
+
+    # Fallback to reading directly from aibot main_config.toml if token is missing
+    if not token or len(token) < 50:
+        for conf_path in ("/home/rs/aibot/main_config.toml", os.path.expanduser("~/aibot/main_config.toml")):
+            try:
+                if os.path.isfile(conf_path):
+                    with open(conf_path, "r", encoding="utf-8") as f:
+                        text = f.read()
+                    import re
+                    m = re.search(r"\[BridgeMedia\][^\[]*access_token\s*=\s*\"([^\"]+)\"", text)
+                    if m:
+                        token = m.group(1).strip()
+                        break
+            except Exception:
+                pass
+
     return base_url, token
 
 
@@ -504,6 +520,9 @@ class WeChatBridgeAdapter(BasePlatformAdapter):
         message_id = str(payload.get("msg_id") or payload.get("message_id") or "") or None
 
         media_urls, media_types, message_type = await self._extract_media(payload)
+        # Direct WeChat callbacks can expose a delivery alias in ``from``.
+        # Keep it as ``chat_id`` for outbound routing, but key the conversation
+        # on the stable sender identity so aliases do not split the session.
         source = self.build_source(
             chat_id=chat_id,
             chat_name=chat_name,

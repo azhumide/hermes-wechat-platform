@@ -4,7 +4,8 @@ kind: platform
 version: 1.0.0
 description: >
   WeChat gateway adapter for Hermes Agent. Connects to the aibot
-  HermesBridge plugin over WebSocket without modifying Hermes source code.
+  HermesBridge plugin over WebSocket and keeps direct-message session
+  identity separate from the bridge delivery target.
 author: local
 optional_env:
   - name: WECHAT_BRIDGE_WS_URL

@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+### Fixed
+- Direct messages now use the stable `senderId` for session routing while
+  preserving the inbound `from` value for outbound delivery.
+
 ## [1.1.0] - 2026-05-17
 
 ### Added
